@@ -30,4 +30,7 @@ https://www.cell.com/oneear/inpress.rss
 https://www.cell.com/matter/inpress.rss
 https://rss.sciencedirect.com/publication/science/03062619
 https://rss.sciencedirect.com/publication/science/03014215
-
+https://www.nature.com/subjects/physical-sciences/ncomms.rss
+https://www.nature.com/subjects/earth-and-environmental-sciences/ncomms.rss
+https://www.nature.com/subjects/biological-sciences/ncomms.rss
+https://www.nature.com/subjects/scientific-community-and-society/ncomms.rss

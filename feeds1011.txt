@@ -41,4 +41,7 @@ https://hydrogentechworld.com/feed/
 https://batteriesnews.com/feed/
 https://about.bnef.com/feed/?post_type=insights&type=press
 https://www.technologyreview.com/topic/climate-change/feed/
-
+https://www.nature.com/subjects/physical-sciences/ncomms.rss
+https://www.nature.com/subjects/earth-and-environmental-sciences/ncomms.rss
+https://www.nature.com/subjects/biological-sciences/ncomms.rss
+https://www.nature.com/subjects/scientific-community-and-society/ncomms.rss

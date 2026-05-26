@@ -1,50 +1,62 @@
-name: RSS Spider
+name: RSS Spider (legacy)
 
 on:
-  schedule:
-    - cron: "0 1 * * *"   # 每天 UTC 01:00 跑日抓取
-    - cron: "10 1 * * 5"  # 每周五 UTC 01:10 跑周汇总（错开10分钟）
   workflow_dispatch:
+    inputs:
+      task:
+        description: "Legacy task to run"
+        required: true
+        default: daily
+        type: choice
+        options:
+          - daily
+          - weekly
+          - all
 
 permissions:
-  contents: write   # 允许 Actions push
+  contents: write
 
-# 防止两个触发器并发写 main 导致冲突
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 concurrency:
   group: rss-spider-main
   cancel-in-progress: false
 
 jobs:
   run-rss-spider:
-    # 每天那条 cron 或手动触发都可以跑这个 job
-    if: github.event.schedule == '0 1 * * *' || github.event_name == 'workflow_dispatch'
+    if: github.event.inputs.task == 'daily' || github.event.inputs.task == 'all'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
-          fetch-depth: 0              # 允许后续 pull/rebase
+          fetch-depth: 0
+          token: ${{ github.token }}
           persist-credentials: true
 
       - name: Print UTC time
         run: date -u
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run spider for UTC yesterday
+      - name: Run legacy spider for UTC yesterday
         run: python spider_2days_1031.py
 
       - name: Commit daily results (rebase-safe)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -e
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           git add output/*.csv || true
           if git diff --cached --quiet; then
@@ -52,29 +64,29 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore: daily RSS results (UTC $(date -u +'%Y-%m-%d'))"
+          git commit -m "chore: legacy daily RSS results (UTC $(date -u +'%Y-%m-%d'))"
           git fetch origin main
           git pull --rebase origin main
           git push origin HEAD:main
 
   run-weekly-aggregate:
-    # 只在“周一 01:10”那条 cron 或手动触发时跑
-    if: github.event.schedule == '10 1 * * 1' || github.event_name == 'workflow_dispatch'
+    if: github.event.inputs.task == 'weekly' || github.event.inputs.task == 'all'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          token: ${{ github.token }}
           persist-credentials: true
 
       - name: Print UTC time
         run: date -u
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -83,10 +95,13 @@ jobs:
         run: python weekly_aggregate.py
 
       - name: Commit weekly results (rebase-safe)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -e
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           git add output/weekly/*.csv || true
           if git diff --cached --quiet; then
@@ -94,7 +109,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore: weekly RSS aggregate (UTC $(date -u +'%Y-%m-%d'))"
+          git commit -m "chore: legacy weekly RSS aggregate (UTC $(date -u +'%Y-%m-%d'))"
           git fetch origin main
           git pull --rebase origin main
           git push origin HEAD:main
