@@ -738,15 +738,66 @@ def maybe_human_like_wait():
         return
     time.sleep(random.uniform(0.6, 1.6))
 
+def clean_nature_abstract_text(text: str) -> str:
+    text = clean_html_text(text or "")
+    text = re.sub(r"^Abstract\s*", "", text, flags=re.IGNORECASE).strip()
+    return text
+
+def extract_nature_abstract_from_heading(page) -> str:
+    try:
+        return page.evaluate(
+            """
+            () => {
+              const isHeading = (el) => /^H[1-6]$/i.test(el.tagName || "");
+              const isAbstractHeading = (el) =>
+                isHeading(el) && (el.textContent || "").trim().toLowerCase() === "abstract";
+              const heading = Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6"))
+                .find(isAbstractHeading);
+              if (!heading) return "";
+
+              const parts = [];
+              let node = heading.nextElementSibling;
+              while (node) {
+                if (isHeading(node)) break;
+                const text = (node.innerText || node.textContent || "").trim();
+                if (text) parts.push(text);
+                node = node.nextElementSibling;
+              }
+              return parts.join("\\n");
+            }
+            """
+        ) or ""
+    except Exception:
+        return ""
+
 def extract_nature_abstract(page) -> str:
     try:
         page.wait_for_timeout(500)
-        el = page.query_selector('section[data-title="Abstract"] .c-article-section__content')
-        if not el:
-            el = page.query_selector('section[aria-labelledby="Abs1"] .c-article-section__content')
-        if not el:
-            return ""
-        return clean_html_text(el.inner_html())
+        selectors = [
+            'section[data-title="Abstract"] .c-article-section__content',
+            'section[data-title="Abstract"]',
+            'section[aria-labelledby="Abs1"] .c-article-section__content',
+            'section[aria-labelledby="Abs1"]',
+            "#Abs1-content",
+            '[data-test="abstract"]',
+        ]
+        for sel in selectors:
+            el = page.query_selector(sel)
+            if not el:
+                continue
+            text = clean_nature_abstract_text(el.inner_html())
+            if text:
+                return text
+
+        for sel in ('meta[name="dc.description"]', 'meta[name="description"]'):
+            el = page.query_selector(sel)
+            if not el:
+                continue
+            text = clean_nature_abstract_text(el.get_attribute("content") or "")
+            if text:
+                return text
+
+        return clean_nature_abstract_text(extract_nature_abstract_from_heading(page))
     except Exception:
         return ""
 
