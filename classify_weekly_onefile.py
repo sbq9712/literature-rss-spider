@@ -20,7 +20,7 @@ Weekly pipeline:
 
 Environment variables:
   GOOGLE_AI_API_KEY or GEMINI_API_KEY (required)
-  GOOGLE_AI_MODEL or GEMINI_MODEL (default gemini-2.5-flash)
+  GOOGLE_AI_MODEL or GEMINI_MODEL (default gemini-2.5-flash-lite)
   GOOGLE_AI_TEMPERATURE (default 0)
   GOOGLE_AI_MAX_RETRIES (default 3)
   GOOGLE_AI_BASE_URL (optional)
