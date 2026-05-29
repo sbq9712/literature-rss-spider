@@ -4,7 +4,7 @@ classify_weekly_onefile.py
 
 Weekly pipeline:
 1) Pick latest weekly CSV in output/weekly (or -i).
-2) (Optional) translate title/abstract into title_zh/abstract_zh unless --skip-translate.
+2) (Optional) Google Translate title/abstract into title_zh/abstract_zh unless --skip-translate.
 3) Hybrid classify:
    - Parse category descriptions from classification.txt (format: 类别名：描述)
    - Extract include/exclude keyword hints heuristically from “包括/不包括” segments
@@ -20,7 +20,7 @@ Weekly pipeline:
 
 Environment variables:
   GOOGLE_AI_API_KEY or GEMINI_API_KEY (required)
-  GOOGLE_AI_MODEL or GEMINI_MODEL (default gemini-2.5-flash-lite)
+  GOOGLE_AI_MODEL or GEMINI_MODEL (default gemini-2.5-flash)
   GOOGLE_AI_TEMPERATURE (default 0)
   GOOGLE_AI_MAX_RETRIES (default 3)
   GOOGLE_AI_RETRY_BASE_SECONDS (default 3)
@@ -28,8 +28,7 @@ Environment variables:
   GOOGLE_AI_BASE_URL (optional)
 
   # Translation
-  TRANSLATE_PROVIDER (default gemini; choices: gemini, google, none)
-  GEMINI_TRANSLATE_FALLBACK_PROVIDER (default google)
+  TRANSLATE_PROVIDER (default google; choices: google, none)
   MAX_ABSTRACT_CHARS_TO_TRANSLATE (default 1600)
   TRANSLATE_BATCH_SIZE_TITLE (default 12)
   TRANSLATE_BATCH_SIZE_ABSTRACT (default 3)
@@ -89,11 +88,13 @@ GOOGLE_AI_BASE_URL = (
     or "https://generativelanguage.googleapis.com/v1beta"
 ).strip().rstrip("/")
 GOOGLE_AI_TIMEOUT = int(os.getenv("GOOGLE_AI_TIMEOUT", os.getenv("GEMINI_TIMEOUT", "120")))
+GEMINI_TRANSLATE_MAX_RETRIES = int(os.getenv("GEMINI_TRANSLATE_MAX_RETRIES", "2"))
+GEMINI_CLASSIFY_MAX_RETRIES = int(os.getenv("GEMINI_CLASSIFY_MAX_RETRIES", os.getenv("GOOGLE_AI_MAX_RETRIES", "3")))
 
 MAX_ABSTRACT_CHARS_TO_TRANSLATE = int(os.getenv("MAX_ABSTRACT_CHARS_TO_TRANSLATE", "1600"))
 TRANSLATE_BATCH_SIZE_TITLE = int(os.getenv("TRANSLATE_BATCH_SIZE_TITLE", "12"))
 TRANSLATE_BATCH_SIZE_ABSTRACT = int(os.getenv("TRANSLATE_BATCH_SIZE_ABSTRACT", "3"))
-TRANSLATE_PROVIDER = os.getenv("TRANSLATE_PROVIDER", "gemini").strip().lower()
+TRANSLATE_PROVIDER = os.getenv("TRANSLATE_PROVIDER", "google").strip().lower()
 GEMINI_TRANSLATE_FALLBACK_PROVIDER = os.getenv("GEMINI_TRANSLATE_FALLBACK_PROVIDER", "google").strip().lower()
 GOOGLE_TRANSLATE_MAX_RETRIES = int(os.getenv("GOOGLE_TRANSLATE_MAX_RETRIES", "4"))
 
@@ -153,6 +154,81 @@ def _stable_id_from_row(row: Dict[str, Any]) -> str:
     base = link if link else f"{title}||{source}||{pub}"
     h = hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()[:16]
     return h
+
+
+def ensure_stable_id_column(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    records = df.to_dict(orient="records")
+    df["stable_id"] = [_stable_id_from_row(r) for r in records]
+    return df
+
+
+def _atomic_write_text(path: Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _save_translation_checkpoint(df: pd.DataFrame, path: Path):
+    cols = ["stable_id", "title_zh", "abstract_zh"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    df[cols].to_csv(tmp, index=False, encoding="utf-8-sig")
+    tmp.replace(path)
+
+
+def _load_translation_checkpoint(df: pd.DataFrame, path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return df
+
+    ckpt = pd.read_csv(path, encoding="utf-8-sig", keep_default_na=False)
+    if "stable_id" not in ckpt.columns:
+        return df
+
+    applied = 0
+    ckpt = ckpt.drop_duplicates("stable_id", keep="last").set_index("stable_id")
+    for col in ["title_zh", "abstract_zh"]:
+        if col not in ckpt.columns:
+            continue
+        for idx, sid in df["stable_id"].items():
+            current = _normalize_cell(df.at[idx, col])
+            cached = _normalize_cell(ckpt.at[sid, col]) if sid in ckpt.index else ""
+            if not current and cached:
+                df.at[idx, col] = cached
+                applied += 1
+    print(f"[checkpoint] loaded translation checkpoint: {path} (applied cells={applied})", flush=True)
+    return df
+
+
+def _load_classification_checkpoint(path: Path, allowed_labels: set) -> Dict[str, List[str]]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[checkpoint] failed to load classification checkpoint {path}: {e}", flush=True)
+        return {}
+
+    raw = data.get("labels_by_id", data) if isinstance(data, dict) else {}
+    out: Dict[str, List[str]] = {}
+    if isinstance(raw, dict):
+        for sid, labels in raw.items():
+            if not isinstance(labels, list):
+                continue
+            clean = [_normalize_cell(x) for x in labels]
+            clean = [x for x in clean if x in allowed_labels]
+            out[str(sid)] = list(dict.fromkeys(clean))
+    print(f"[checkpoint] loaded classification checkpoint: {path} (items={len(out)})", flush=True)
+    return out
+
+
+def _save_classification_checkpoint(path: Path, labels_by_id: Dict[str, List[str]]):
+    payload = {
+        "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "labels_by_id": labels_by_id,
+    }
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _extract_date_from_name(filename: str):
@@ -326,9 +402,10 @@ def _extract_content(resp) -> str:
     return resp.choices[0].message.content
 
 
-def _call_with_retries(client, messages, label: str, json_object: bool = True):
+def _call_with_retries(client, messages, label: str, json_object: bool = True, max_retries: Optional[int] = None):
+    max_retries = max_retries or GOOGLE_AI_MAX_RETRIES
     last_err = None
-    for attempt in range(1, GOOGLE_AI_MAX_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         try:
             return _gemini_generate_content(client, messages, json_object=json_object)
         except Exception as e:
@@ -337,7 +414,7 @@ def _call_with_retries(client, messages, label: str, json_object: bool = True):
             wait = wait + random.uniform(0, min(3.0, wait * 0.25))
             print(f"[gemini:{label}] error on attempt {attempt}: {e} (wait {wait:.1f}s)", flush=True)
             time.sleep(wait)
-    raise RuntimeError(f"Gemini request failed after {GOOGLE_AI_MAX_RETRIES} attempts: {last_err}")
+    raise RuntimeError(f"Gemini request failed after {max_retries} attempts: {last_err}")
 
 
 # ============================
@@ -569,7 +646,7 @@ def translate_texts(client, texts, label: str) -> List[str]:
         f"inputs={json.dumps(texts, ensure_ascii=False)}"
     )
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-    resp = _call_with_retries(client, messages, f"translate:{label}", json_object=True)
+    resp = _call_with_retries(client, messages, f"translate:{label}", json_object=True, max_retries=GEMINI_TRANSLATE_MAX_RETRIES)
     content = _clean_json_text(_extract_content(resp))
 
     try:
@@ -584,30 +661,22 @@ def translate_texts(client, texts, label: str) -> List[str]:
 
 
 def translate_texts_with_provider(client, texts, label: str, provider: str) -> List[str]:
-    provider = (provider or "gemini").strip().lower()
+    provider = (provider or "google").strip().lower()
     if provider in {"none", "skip"}:
         return ["" for _ in texts]
     if provider in {"google", "google_translate", "free"}:
         return google_translate_texts(texts, label)
-    if provider != "gemini":
-        raise RuntimeError(f"Unsupported translation provider: {provider}")
-
-    try:
-        return translate_texts(client, texts, label)
-    except Exception as e:
-        fallback = GEMINI_TRANSLATE_FALLBACK_PROVIDER
-        if fallback in {"google", "google_translate", "free"}:
-            print(f"[translate:{label}] Gemini failed; falling back to Google Translate for this batch: {e}", flush=True)
-            return google_translate_texts(texts, label)
-        if fallback in {"none", "skip", ""}:
-            raise
-        raise RuntimeError(f"Unsupported GEMINI_TRANSLATE_FALLBACK_PROVIDER={fallback}") from e
+    raise RuntimeError(f"Unsupported translation provider: {provider}. Use google or none.")
 
 
-def enrich_translation(df: pd.DataFrame, provider: str = "gemini") -> pd.DataFrame:
+def enrich_translation(df: pd.DataFrame, provider: str = "google", checkpoint_path: Optional[Path] = None) -> pd.DataFrame:
     df = df.copy()
     df = ensure_base_columns(df)
+    df = ensure_stable_id_column(df)
     provider = (provider or "gemini").strip().lower()
+
+    if checkpoint_path is not None:
+        df = _load_translation_checkpoint(df, checkpoint_path)
 
     need_title_idx = df.index[(df["title"].str.strip() != "") & (df["title_zh"].str.strip() == "")].tolist()
     need_abs_idx = df.index[(df["abstract"].str.strip() != "") & (df["abstract_zh"].str.strip() == "")].tolist()
@@ -620,42 +689,46 @@ def enrich_translation(df: pd.DataFrame, provider: str = "gemini") -> pd.DataFra
         print("[plan] nothing to translate", flush=True)
         return df
 
-    client = _build_gemini_client() if provider == "gemini" else None
+    client = None
 
     if need_title_idx:
-        titles = df.loc[need_title_idx, "title"].tolist()
-        translated = []
         start = time.time()
-        total = len(titles)
-        for batch in _chunked(titles, TRANSLATE_BATCH_SIZE_TITLE):
-            translated.extend(translate_texts_with_provider(client, batch, "title", provider))
-            done = len(translated)
+        total = len(need_title_idx)
+        done = 0
+        for batch_idx in _chunked(need_title_idx, TRANSLATE_BATCH_SIZE_TITLE):
+            batch = df.loc[batch_idx, "title"].tolist()
+            translated = translate_texts_with_provider(client, batch, "title", provider)
+            for idx, zh in zip(batch_idx, translated):
+                df.at[idx, "title_zh"] = zh
+            done += len(batch_idx)
+            if checkpoint_path is not None:
+                _save_translation_checkpoint(df, checkpoint_path)
             elapsed = time.time() - start
             rate = done / elapsed if elapsed > 0 else 0.0
             eta = (total - done) / rate if rate > 0 else 0.0
             print(f"[translate:title] {done}/{total} | elapsed={_fmt_secs(elapsed)} | rate={rate:.2f} items/s | ETA={_fmt_secs(eta)}", flush=True)
-        df.loc[need_title_idx, "title_zh"] = translated
 
     if need_abs_idx:
-        abstracts = df.loc[need_abs_idx, "abstract"].tolist()
-        clipped = []
-        for x in abstracts:
-            x = _normalize_cell(x)
-            if len(x) > MAX_ABSTRACT_CHARS_TO_TRANSLATE:
-                x = x[:MAX_ABSTRACT_CHARS_TO_TRANSLATE]
-            clipped.append(x)
-
-        translated = []
         start = time.time()
-        total = len(clipped)
-        for batch in _chunked(clipped, TRANSLATE_BATCH_SIZE_ABSTRACT):
-            translated.extend(translate_texts_with_provider(client, batch, "abstract", provider))
-            done = len(translated)
+        total = len(need_abs_idx)
+        done = 0
+        for batch_idx in _chunked(need_abs_idx, TRANSLATE_BATCH_SIZE_ABSTRACT):
+            batch = []
+            for idx in batch_idx:
+                x = _normalize_cell(df.at[idx, "abstract"])
+                if len(x) > MAX_ABSTRACT_CHARS_TO_TRANSLATE:
+                    x = x[:MAX_ABSTRACT_CHARS_TO_TRANSLATE]
+                batch.append(x)
+            translated = translate_texts_with_provider(client, batch, "abstract", provider)
+            for idx, zh in zip(batch_idx, translated):
+                df.at[idx, "abstract_zh"] = zh
+            done += len(batch_idx)
+            if checkpoint_path is not None:
+                _save_translation_checkpoint(df, checkpoint_path)
             elapsed = time.time() - start
             rate = done / elapsed if elapsed > 0 else 0.0
             eta = (total - done) / rate if rate > 0 else 0.0
             print(f"[translate:abstract] {done}/{total} | elapsed={_fmt_secs(elapsed)} | rate={rate:.2f} items/s | ETA={_fmt_secs(eta)}", flush=True)
-        df.loc[need_abs_idx, "abstract_zh"] = translated
 
     return df
 
@@ -706,7 +779,13 @@ def gemini_classify_by_id(
     )
 
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-    resp = _call_with_retries(client, messages, f"classify:{label}", json_object=True)
+    resp = _call_with_retries(
+        client,
+        messages,
+        f"classify:{label}",
+        json_object=True,
+        max_retries=GEMINI_CLASSIFY_MAX_RETRIES,
+    )
     content = _clean_json_text(_extract_content(resp))
 
     try:
@@ -742,6 +821,7 @@ def classify_hybrid(
     rules: List[CategoryRule],
     debug_dir: Path,
     skip_gpt: bool = False,
+    checkpoint_path: Optional[Path] = None,
 ) -> Tuple[pd.DataFrame, List[List[str]], List[str]]:
     """
     Returns:
@@ -751,11 +831,11 @@ def classify_hybrid(
     """
     df = df.copy()
     df = ensure_base_columns(df)
+    df = ensure_stable_id_column(df)
 
     # Build items
     records = df.to_dict(orient="records")
-    ids = [_stable_id_from_row(r) for r in records]
-    df["stable_id"] = ids
+    ids = df["stable_id"].tolist()
 
     texts = [build_text_for_classify(r.get("title", ""), r.get("abstract", "")) for r in records]
     titles = [_normalize_cell(r.get("title", "")) for r in records]
@@ -869,12 +949,22 @@ def classify_hybrid(
     # Gemini final confirmation for those not auto-labeled
     final_labels: Dict[str, List[str]] = {ids[i]: auto_labels[i] for i in range(len(records)) if auto_labels[i]}
     still_missing_ids: List[str] = []
+    checkpoint_labels: Dict[str, List[str]] = {}
+    if checkpoint_path is not None:
+        checkpoint_labels = _load_classification_checkpoint(checkpoint_path, set(cat_names))
+        for _id, labs in checkpoint_labels.items():
+            if _id in ids:
+                final_labels[_id] = labs
+        if final_labels:
+            _save_classification_checkpoint(checkpoint_path, final_labels)
 
     if skip_gpt:
         print("[gemini] skip_gpt enabled; leaving non-auto items as []", flush=True)
         for i in range(len(records)):
             if ids[i] not in final_labels:
                 final_labels[ids[i]] = []
+        if checkpoint_path is not None:
+            _save_classification_checkpoint(checkpoint_path, final_labels)
     else:
         client = _build_gemini_client()
 
@@ -908,18 +998,14 @@ def classify_hybrid(
                 except Exception as e:
                     print(f"[gemini:{tag}] batch failed after retries ({len(batch)} items): {e}", flush=True)
                     resp_map = {}
-                    if len(batch) > 1:
-                        print(f"[gemini:{tag}] retrying failed batch item-by-item", flush=True)
-                        for it in batch:
-                            try:
-                                resp_map.update(gemini_classify_by_id(client, rules, [it], label=f"{tag}:single:{it['id']}"))
-                            except Exception as e2:
-                                print(f"[gemini:{tag}] item {it['id']} failed; will mark missing: {e2}", flush=True)
                 # merge
                 for it in batch:
                     _id = it["id"]
                     if _id in resp_map:
                         out_map[_id] = resp_map[_id]
+                        final_labels[_id] = resp_map[_id]
+                if checkpoint_path is not None and final_labels:
+                    _save_classification_checkpoint(checkpoint_path, final_labels)
                 done = len(out_map)
                 elapsed = time.time() - start0
                 rate = (done / elapsed) if elapsed > 0 else 0.0
@@ -1309,6 +1395,7 @@ def df_to_word_bilingual_grouped(
 # main
 # ============================
 def main():
+    global GOOGLE_AI_MODEL
     parser = argparse.ArgumentParser()
     parser.add_argument("-i", "--input", default="", help="Input weekly CSV path (default: latest in output/weekly)")
     parser.add_argument("-c", "--classification", default=DEFAULT_CLASSIFICATION_FILE, help="Classification rules file")
@@ -1317,14 +1404,24 @@ def main():
     parser.add_argument(
         "--translation-provider",
         default=TRANSLATE_PROVIDER,
-        choices=["gemini", "google", "none"],
-        help="Translation route: gemini, google, or none. Gemini can fall back via GEMINI_TRANSLATE_FALLBACK_PROVIDER.",
+        choices=["google", "none"],
+        help="Translation route: google or none. Classification still uses Gemini.",
+    )
+    parser.add_argument(
+        "--classification-model",
+        default=GOOGLE_AI_MODEL,
+        choices=["gemini-2.5-flash", "gemini-2.5-flash-lite"],
+        help="Gemini model for classification only.",
     )
     parser.add_argument("--output-suffix", default="_translated", help="Suffix inserted before .xlsx/.docx")
+    parser.add_argument("--save-translated-csv", action="store_true", help="Save translated rows before classification")
+    parser.add_argument("--checkpoint-dir", default="output/checkpoints", help="Directory for resumable translation/classification checkpoints")
+    parser.add_argument("--no-resume", action="store_true", help="Ignore existing checkpoints for this run")
     parser.add_argument("--skip-gpt", action="store_true", help="Skip Gemini classification (only keyword+embedding)")
     parser.add_argument("--debug-dir", default="output/debug", help="Debug folder for failure artifacts")
     args = parser.parse_args()
 
+    GOOGLE_AI_MODEL = args.classification_model.strip()
     if not GOOGLE_AI_MODEL:
         raise RuntimeError("GOOGLE_AI_MODEL is empty. Set GOOGLE_AI_MODEL or GEMINI_MODEL env.")
 
@@ -1342,10 +1439,22 @@ def main():
     ordered_categories = [r.name for r in rules]
     print(f"[classify] loaded categories ({len(ordered_categories)}): {ordered_categories}", flush=True)
 
+    output_suffix = args.output_suffix if args.output_suffix.startswith("_") else "_" + args.output_suffix
+    checkpoint_base = Path(args.checkpoint_dir) / f"{csv_path.stem}{output_suffix}"
+    translation_checkpoint = checkpoint_base.with_name(checkpoint_base.name + "_translation.csv")
+    classification_checkpoint = checkpoint_base.with_name(checkpoint_base.name + "_classification.json")
+    if args.no_resume:
+        translation_checkpoint = None
+        classification_checkpoint = None
+        print("[checkpoint] resume disabled by --no-resume", flush=True)
+    else:
+        print(f"[checkpoint] translation: {translation_checkpoint}", flush=True)
+        print(f"[checkpoint] classification: {classification_checkpoint}", flush=True)
+
     translation_provider = "none" if args.skip_translate else args.translation_provider
-    if translation_provider != "none" and not args.skip_gpt:
-        # Translation is independent from classification; classification still uses Gemini below.
-        df = enrich_translation(df, provider=translation_provider)
+    if translation_provider != "none":
+        # Translation uses Google Translate only. Classification still uses English title/abstract below.
+        df = enrich_translation(df, provider=translation_provider, checkpoint_path=translation_checkpoint)
     else:
         if args.skip_translate:
             print("[plan] skip translation by --skip-translate", flush=True)
@@ -1356,14 +1465,19 @@ def main():
 
     debug_dir = Path(args.debug_dir)
 
+    if args.save_translated_csv:
+        translated_csv = csv_path.with_name(csv_path.stem + output_suffix + ".csv")
+        df.to_csv(translated_csv, index=False, encoding="utf-8-sig")
+        print(f"[io] Wrote translated CSV checkpoint: {translated_csv}", flush=True)
+
     df2, labels_list, still_missing_ids = classify_hybrid(
         df=df,
         rules=rules,
         debug_dir=debug_dir,
         skip_gpt=args.skip_gpt,
+        checkpoint_path=classification_checkpoint,
     )
 
-    output_suffix = args.output_suffix if args.output_suffix.startswith("_") else "_" + args.output_suffix
     output_xlsx = csv_path.with_name(csv_path.stem + output_suffix + ".xlsx")
     write_grouped_xlsx(df2, labels_list, ordered_categories, still_missing_ids, str(output_xlsx))
     print(f"[io] Wrote XLSX: {output_xlsx}", flush=True)
