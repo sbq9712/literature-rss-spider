@@ -4,7 +4,7 @@ classify_weekly_onefile.py
 
 Weekly pipeline:
 1) Pick latest weekly CSV in output/weekly (or -i).
-2) (Optional) translate title/abstract into title_zh/abstract_zh unless --skip-translate.
+2) (Optional) Google Translate title/abstract into title_zh/abstract_zh unless --skip-translate.
 3) Hybrid classify:
    - Parse category descriptions from classification.txt (format: 类别名：描述)
    - Extract include/exclude keyword hints heuristically from “包括/不包括” segments
@@ -20,7 +20,7 @@ Weekly pipeline:
 
 Environment variables:
   GOOGLE_AI_API_KEY or GEMINI_API_KEY (required)
-  GOOGLE_AI_MODEL or GEMINI_MODEL (default gemini-2.5-flash-lite)
+  GOOGLE_AI_MODEL or GEMINI_MODEL (default gemini-2.5-flash)
   GOOGLE_AI_TEMPERATURE (default 0)
   GOOGLE_AI_MAX_RETRIES (default 3)
   GOOGLE_AI_RETRY_BASE_SECONDS (default 3)
@@ -28,8 +28,7 @@ Environment variables:
   GOOGLE_AI_BASE_URL (optional)
 
   # Translation
-  TRANSLATE_PROVIDER (default gemini; choices: gemini, google, none)
-  GEMINI_TRANSLATE_FALLBACK_PROVIDER (default google)
+  TRANSLATE_PROVIDER (default google; choices: google, none)
   MAX_ABSTRACT_CHARS_TO_TRANSLATE (default 1600)
   TRANSLATE_BATCH_SIZE_TITLE (default 12)
   TRANSLATE_BATCH_SIZE_ABSTRACT (default 3)
@@ -95,7 +94,7 @@ GEMINI_CLASSIFY_MAX_RETRIES = int(os.getenv("GEMINI_CLASSIFY_MAX_RETRIES", os.ge
 MAX_ABSTRACT_CHARS_TO_TRANSLATE = int(os.getenv("MAX_ABSTRACT_CHARS_TO_TRANSLATE", "1600"))
 TRANSLATE_BATCH_SIZE_TITLE = int(os.getenv("TRANSLATE_BATCH_SIZE_TITLE", "12"))
 TRANSLATE_BATCH_SIZE_ABSTRACT = int(os.getenv("TRANSLATE_BATCH_SIZE_ABSTRACT", "3"))
-TRANSLATE_PROVIDER = os.getenv("TRANSLATE_PROVIDER", "gemini").strip().lower()
+TRANSLATE_PROVIDER = os.getenv("TRANSLATE_PROVIDER", "google").strip().lower()
 GEMINI_TRANSLATE_FALLBACK_PROVIDER = os.getenv("GEMINI_TRANSLATE_FALLBACK_PROVIDER", "google").strip().lower()
 GOOGLE_TRANSLATE_MAX_RETRIES = int(os.getenv("GOOGLE_TRANSLATE_MAX_RETRIES", "4"))
 
@@ -662,27 +661,15 @@ def translate_texts(client, texts, label: str) -> List[str]:
 
 
 def translate_texts_with_provider(client, texts, label: str, provider: str) -> List[str]:
-    provider = (provider or "gemini").strip().lower()
+    provider = (provider or "google").strip().lower()
     if provider in {"none", "skip"}:
         return ["" for _ in texts]
     if provider in {"google", "google_translate", "free"}:
         return google_translate_texts(texts, label)
-    if provider != "gemini":
-        raise RuntimeError(f"Unsupported translation provider: {provider}")
-
-    try:
-        return translate_texts(client, texts, label)
-    except Exception as e:
-        fallback = GEMINI_TRANSLATE_FALLBACK_PROVIDER
-        if fallback in {"google", "google_translate", "free"}:
-            print(f"[translate:{label}] Gemini failed; falling back to Google Translate for this batch: {e}", flush=True)
-            return google_translate_texts(texts, label)
-        if fallback in {"none", "skip", ""}:
-            raise
-        raise RuntimeError(f"Unsupported GEMINI_TRANSLATE_FALLBACK_PROVIDER={fallback}") from e
+    raise RuntimeError(f"Unsupported translation provider: {provider}. Use google or none.")
 
 
-def enrich_translation(df: pd.DataFrame, provider: str = "gemini", checkpoint_path: Optional[Path] = None) -> pd.DataFrame:
+def enrich_translation(df: pd.DataFrame, provider: str = "google", checkpoint_path: Optional[Path] = None) -> pd.DataFrame:
     df = df.copy()
     df = ensure_base_columns(df)
     df = ensure_stable_id_column(df)
@@ -702,7 +689,7 @@ def enrich_translation(df: pd.DataFrame, provider: str = "gemini", checkpoint_pa
         print("[plan] nothing to translate", flush=True)
         return df
 
-    client = _build_gemini_client() if provider == "gemini" else None
+    client = None
 
     if need_title_idx:
         start = time.time()
@@ -1408,6 +1395,7 @@ def df_to_word_bilingual_grouped(
 # main
 # ============================
 def main():
+    global GOOGLE_AI_MODEL
     parser = argparse.ArgumentParser()
     parser.add_argument("-i", "--input", default="", help="Input weekly CSV path (default: latest in output/weekly)")
     parser.add_argument("-c", "--classification", default=DEFAULT_CLASSIFICATION_FILE, help="Classification rules file")
@@ -1416,8 +1404,14 @@ def main():
     parser.add_argument(
         "--translation-provider",
         default=TRANSLATE_PROVIDER,
-        choices=["gemini", "google", "none"],
-        help="Translation route: gemini, google, or none. Gemini can fall back via GEMINI_TRANSLATE_FALLBACK_PROVIDER.",
+        choices=["google", "none"],
+        help="Translation route: google or none. Classification still uses Gemini.",
+    )
+    parser.add_argument(
+        "--classification-model",
+        default=GOOGLE_AI_MODEL,
+        choices=["gemini-2.5-flash", "gemini-2.5-flash-lite"],
+        help="Gemini model for classification only.",
     )
     parser.add_argument("--output-suffix", default="_translated", help="Suffix inserted before .xlsx/.docx")
     parser.add_argument("--save-translated-csv", action="store_true", help="Save translated rows before classification")
@@ -1427,6 +1421,7 @@ def main():
     parser.add_argument("--debug-dir", default="output/debug", help="Debug folder for failure artifacts")
     args = parser.parse_args()
 
+    GOOGLE_AI_MODEL = args.classification_model.strip()
     if not GOOGLE_AI_MODEL:
         raise RuntimeError("GOOGLE_AI_MODEL is empty. Set GOOGLE_AI_MODEL or GEMINI_MODEL env.")
 
@@ -1457,8 +1452,8 @@ def main():
         print(f"[checkpoint] classification: {classification_checkpoint}", flush=True)
 
     translation_provider = "none" if args.skip_translate else args.translation_provider
-    if translation_provider != "none" and not args.skip_gpt:
-        # Translation is independent from classification; classification still uses Gemini below.
+    if translation_provider != "none":
+        # Translation uses Google Translate only. Classification still uses English title/abstract below.
         df = enrich_translation(df, provider=translation_provider, checkpoint_path=translation_checkpoint)
     else:
         if args.skip_translate:
