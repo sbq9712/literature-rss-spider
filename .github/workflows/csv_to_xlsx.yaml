@@ -46,12 +46,26 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      - name: Run classify_weekly_onefile.py
+      - name: Run classify_weekly_onefile.py (Gemini translation)
         env:
           GOOGLE_AI_API_KEY: ${{ secrets.GOOGLE_AI_API_KEY }}
           GOOGLE_AI_MODEL: gemini-2.5-flash
+          GOOGLE_AI_MAX_RETRIES: "6"
+          GOOGLE_AI_RETRY_BASE_SECONDS: "5"
+          GOOGLE_AI_RETRY_MAX_SECONDS: "90"
+          GEMINI_TRANSLATE_FALLBACK_PROVIDER: google
         run: |
-          python3 classify_weekly_onefile.py -c classification.txt
+          python3 classify_weekly_onefile.py -c classification.txt --translation-provider gemini --output-suffix _gemini_translated
+
+      - name: Run classify_weekly_onefile.py (Google Translate + Gemini classification)
+        env:
+          GOOGLE_AI_API_KEY: ${{ secrets.GOOGLE_AI_API_KEY }}
+          GOOGLE_AI_MODEL: gemini-2.5-flash
+          GOOGLE_AI_MAX_RETRIES: "6"
+          GOOGLE_AI_RETRY_BASE_SECONDS: "5"
+          GOOGLE_AI_RETRY_MAX_SECONDS: "90"
+        run: |
+          python3 classify_weekly_onefile.py -c classification.txt --translation-provider google --output-suffix _google_translated
 
       - name: Commit outputs (only translated files)
         env:
