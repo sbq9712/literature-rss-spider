@@ -58,6 +58,7 @@ jobs:
           python3 classify_weekly_onefile.py -c classification.txt --translation-provider google --output-suffix _translated --save-translated-csv
 
       - name: Commit outputs (only translated files)
+        if: always()
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -68,6 +69,7 @@ jobs:
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           # 只添加本次 translated 文件
+          git add output/checkpoints/* || true
           git add output/weekly/*_translated.csv || true
           git add output/weekly/*_translated.xlsx || true
           git add output/weekly/*_translated.docx || true
