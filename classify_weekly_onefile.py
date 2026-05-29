@@ -89,6 +89,8 @@ GOOGLE_AI_BASE_URL = (
     or "https://generativelanguage.googleapis.com/v1beta"
 ).strip().rstrip("/")
 GOOGLE_AI_TIMEOUT = int(os.getenv("GOOGLE_AI_TIMEOUT", os.getenv("GEMINI_TIMEOUT", "120")))
+GEMINI_TRANSLATE_MAX_RETRIES = int(os.getenv("GEMINI_TRANSLATE_MAX_RETRIES", "2"))
+GEMINI_CLASSIFY_MAX_RETRIES = int(os.getenv("GEMINI_CLASSIFY_MAX_RETRIES", os.getenv("GOOGLE_AI_MAX_RETRIES", "3")))
 
 MAX_ABSTRACT_CHARS_TO_TRANSLATE = int(os.getenv("MAX_ABSTRACT_CHARS_TO_TRANSLATE", "1600"))
 TRANSLATE_BATCH_SIZE_TITLE = int(os.getenv("TRANSLATE_BATCH_SIZE_TITLE", "12"))
@@ -326,9 +328,10 @@ def _extract_content(resp) -> str:
     return resp.choices[0].message.content
 
 
-def _call_with_retries(client, messages, label: str, json_object: bool = True):
+def _call_with_retries(client, messages, label: str, json_object: bool = True, max_retries: Optional[int] = None):
+    max_retries = max_retries or GOOGLE_AI_MAX_RETRIES
     last_err = None
-    for attempt in range(1, GOOGLE_AI_MAX_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         try:
             return _gemini_generate_content(client, messages, json_object=json_object)
         except Exception as e:
@@ -337,7 +340,7 @@ def _call_with_retries(client, messages, label: str, json_object: bool = True):
             wait = wait + random.uniform(0, min(3.0, wait * 0.25))
             print(f"[gemini:{label}] error on attempt {attempt}: {e} (wait {wait:.1f}s)", flush=True)
             time.sleep(wait)
-    raise RuntimeError(f"Gemini request failed after {GOOGLE_AI_MAX_RETRIES} attempts: {last_err}")
+    raise RuntimeError(f"Gemini request failed after {max_retries} attempts: {last_err}")
 
 
 # ============================
@@ -569,7 +572,7 @@ def translate_texts(client, texts, label: str) -> List[str]:
         f"inputs={json.dumps(texts, ensure_ascii=False)}"
     )
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-    resp = _call_with_retries(client, messages, f"translate:{label}", json_object=True)
+    resp = _call_with_retries(client, messages, f"translate:{label}", json_object=True, max_retries=GEMINI_TRANSLATE_MAX_RETRIES)
     content = _clean_json_text(_extract_content(resp))
 
     try:
@@ -706,7 +709,13 @@ def gemini_classify_by_id(
     )
 
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-    resp = _call_with_retries(client, messages, f"classify:{label}", json_object=True)
+    resp = _call_with_retries(
+        client,
+        messages,
+        f"classify:{label}",
+        json_object=True,
+        max_retries=GEMINI_CLASSIFY_MAX_RETRIES,
+    )
     content = _clean_json_text(_extract_content(resp))
 
     try:
@@ -908,13 +917,6 @@ def classify_hybrid(
                 except Exception as e:
                     print(f"[gemini:{tag}] batch failed after retries ({len(batch)} items): {e}", flush=True)
                     resp_map = {}
-                    if len(batch) > 1:
-                        print(f"[gemini:{tag}] retrying failed batch item-by-item", flush=True)
-                        for it in batch:
-                            try:
-                                resp_map.update(gemini_classify_by_id(client, rules, [it], label=f"{tag}:single:{it['id']}"))
-                            except Exception as e2:
-                                print(f"[gemini:{tag}] item {it['id']} failed; will mark missing: {e2}", flush=True)
                 # merge
                 for it in batch:
                     _id = it["id"]
@@ -1321,6 +1323,7 @@ def main():
         help="Translation route: gemini, google, or none. Gemini can fall back via GEMINI_TRANSLATE_FALLBACK_PROVIDER.",
     )
     parser.add_argument("--output-suffix", default="_translated", help="Suffix inserted before .xlsx/.docx")
+    parser.add_argument("--save-translated-csv", action="store_true", help="Save translated rows before classification")
     parser.add_argument("--skip-gpt", action="store_true", help="Skip Gemini classification (only keyword+embedding)")
     parser.add_argument("--debug-dir", default="output/debug", help="Debug folder for failure artifacts")
     args = parser.parse_args()
@@ -1355,6 +1358,12 @@ def main():
             print("[plan] skip Gemini classification by --skip-gpt", flush=True)
 
     debug_dir = Path(args.debug_dir)
+    output_suffix = args.output_suffix if args.output_suffix.startswith("_") else "_" + args.output_suffix
+
+    if args.save_translated_csv:
+        translated_csv = csv_path.with_name(csv_path.stem + output_suffix + ".csv")
+        df.to_csv(translated_csv, index=False, encoding="utf-8-sig")
+        print(f"[io] Wrote translated CSV checkpoint: {translated_csv}", flush=True)
 
     df2, labels_list, still_missing_ids = classify_hybrid(
         df=df,
@@ -1363,7 +1372,6 @@ def main():
         skip_gpt=args.skip_gpt,
     )
 
-    output_suffix = args.output_suffix if args.output_suffix.startswith("_") else "_" + args.output_suffix
     output_xlsx = csv_path.with_name(csv_path.stem + output_suffix + ".xlsx")
     write_grouped_xlsx(df2, labels_list, ordered_categories, still_missing_ids, str(output_xlsx))
     print(f"[io] Wrote XLSX: {output_xlsx}", flush=True)

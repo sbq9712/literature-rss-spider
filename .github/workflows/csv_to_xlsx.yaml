@@ -46,26 +46,16 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      - name: Run classify_weekly_onefile.py (Gemini translation)
+      - name: Run classify_weekly_onefile.py
         env:
           GOOGLE_AI_API_KEY: ${{ secrets.GOOGLE_AI_API_KEY }}
           GOOGLE_AI_MODEL: gemini-2.5-flash
-          GOOGLE_AI_MAX_RETRIES: "6"
-          GOOGLE_AI_RETRY_BASE_SECONDS: "5"
-          GOOGLE_AI_RETRY_MAX_SECONDS: "90"
-          GEMINI_TRANSLATE_FALLBACK_PROVIDER: google
+          GOOGLE_AI_MAX_RETRIES: "3"
+          GEMINI_CLASSIFY_MAX_RETRIES: "2"
+          GOOGLE_AI_RETRY_BASE_SECONDS: "4"
+          GOOGLE_AI_RETRY_MAX_SECONDS: "30"
         run: |
-          python3 classify_weekly_onefile.py -c classification.txt --translation-provider gemini --output-suffix _gemini_translated
-
-      - name: Run classify_weekly_onefile.py (Google Translate + Gemini classification)
-        env:
-          GOOGLE_AI_API_KEY: ${{ secrets.GOOGLE_AI_API_KEY }}
-          GOOGLE_AI_MODEL: gemini-2.5-flash
-          GOOGLE_AI_MAX_RETRIES: "6"
-          GOOGLE_AI_RETRY_BASE_SECONDS: "5"
-          GOOGLE_AI_RETRY_MAX_SECONDS: "90"
-        run: |
-          python3 classify_weekly_onefile.py -c classification.txt --translation-provider google --output-suffix _google_translated
+          python3 classify_weekly_onefile.py -c classification.txt --translation-provider google --output-suffix _translated --save-translated-csv
 
       - name: Commit outputs (only translated files)
         env:
@@ -78,6 +68,7 @@ jobs:
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           # 只添加本次 translated 文件
+          git add output/weekly/*_translated.csv || true
           git add output/weekly/*_translated.xlsx || true
           git add output/weekly/*_translated.docx || true
 
