@@ -55,6 +55,10 @@ REQ_TIMEOUT = 15
 API_SLEEP = 0.5
 NCBI_TOOL = "literature_bot"
 NCBI_EMAIL = os.getenv("NCBI_EMAIL", "qiaochuzhang@outlook.com")
+RSS_REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; literature-rss-spider/1.0; +https://github.com/)",
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+}
 
 # Playwright：CI 默认 headless
 HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "1") == "1"
@@ -97,7 +101,16 @@ ACS_TRASH_TITLES = {
     "issue publication information",
 }
 
-TITLE_EXCLUDE_KEYWORDS = ["editorial", "masthead", "issue information", "cover"]
+TITLE_EXCLUDE_KEYWORDS = [
+    "editorial",
+    "masthead",
+    "issue information",
+    "publication information",
+    "information for authors",
+    "society information",
+    "table of contents",
+    "cover",
+]
 
 # OUP(NSR) RSS description 抽摘要
 OUP_ABS_RE = re.compile(
@@ -333,7 +346,7 @@ def get_entry_pub_date(entry):
         return datetime(*t[:6], tzinfo=timezone.utc)
 
     dt = None
-    for key in ("published", "updated"):
+    for key in ("published", "updated", "date", "dc_date", "prism_publicationdate"):
         dt = parse_date_strict(entry.get(key))
         if dt:
             break
@@ -423,6 +436,36 @@ def extract_oup_abstract_from_rss(desc_html: str) -> str:
     if not m:
         return ""
     return clean_html_text(m.group(1))
+
+def is_trusted_rss_abstract_source(feed_url: str, source_title: str, link: str) -> bool:
+    raw = " ".join([feed_url or "", source_title or "", link or ""]).lower()
+    return any(
+        marker in raw
+        for marker in (
+            "feeds.aps.org/rss/recent/",
+            "ieeexplore.ieee.org/rss/toc",
+            "iopscience.iop.org/journal/rss/",
+            "nmlett.org/index.php/nml/gateway/plugin/webfeedgatewayplugin",
+            "pubs.acs.org/action/showfeed",
+            "rss.sciencedirect.com/publication/science/03702693",
+        )
+    )
+
+def extract_rss_description_abstract(desc_html: str, title: str = "") -> str:
+    text = fix_mojibake(clean_html_text(desc_html))
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    low = text.lower().strip()
+    if low in {"null", "none", "no abstract", "n/a"}:
+        return ""
+    if title and low == (title or "").strip().lower():
+        return ""
+    if low.startswith("latest articles for ") or low.startswith("recent articles in "):
+        return ""
+    if len(text) < 80:
+        return ""
+    return text
 
 CELL_INPRESS_JOURNALS = {"chem", "joule", "oneear", "matter"}
 
@@ -945,7 +988,7 @@ def collect_rss_records(prev_by_key, prev_has_abs_keys, prev_no_abs_recent3_keys
 
     for feed_url in urls:
         print(f"\n📡 RSS: {feed_url}")
-        feed = feedparser.parse(feed_url)
+        feed = feedparser.parse(feed_url, request_headers=RSS_REQUEST_HEADERS)
         source_title = feed.feed.get("title", feed_url)
 
         is_sd_special = feed_url in SD_SPECIAL_URLS
@@ -1047,6 +1090,11 @@ def collect_rss_records(prev_by_key, prev_has_abs_keys, prev_no_abs_recent3_keys
                 if abs_txt:
                     abstract = abs_txt
                     abstract_source = "rss_oup"
+            elif not abstract and is_trusted_rss_abstract_source(feed_url, source_title, link):
+                abs_txt = extract_rss_description_abstract(desc_html, title)
+                if abs_txt:
+                    abstract = abs_txt
+                    abstract_source = "rss_description"
 
             must_have_abstract = (key in prev_no_abs_recent3_keys) or bool(r.get("must_have_abstract")) if r else (key in prev_no_abs_recent3_keys)
 

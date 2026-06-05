@@ -32,6 +32,22 @@ MONTHS = {
     "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
 }
 
+RSS_REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; literature-rss-spider/1.0; +https://github.com/)",
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+}
+
+TITLE_EXCLUDE_KEYWORDS = [
+    "editorial",
+    "masthead",
+    "issue information",
+    "publication information",
+    "information for authors",
+    "society information",
+    "table of contents",
+    "cover",
+]
+
 def clean_html_text(s: str) -> str:
     if not s:
         return ""
@@ -62,6 +78,12 @@ def looks_generic(title: str) -> bool:
     if not t:
         return True
     return t in GENERIC_TITLES or len(t) < 5
+
+def should_drop_by_title(title: str) -> bool:
+    t = (title or "").strip().lower()
+    if not t:
+        return True
+    return any(kw in t for kw in TITLE_EXCLUDE_KEYWORDS)
 
 def extract_alt_from_html(html: str) -> str | None:
     if not html:
@@ -157,7 +179,7 @@ def get_entry_pub_date(entry) -> datetime | None:
         return datetime(*t[:6], tzinfo=timezone.utc)
 
     dt = None
-    for key in ("published", "updated"):
+    for key in ("published", "updated", "date", "dc_date", "prism_publicationdate"):
         dt = parse_date_strict(entry.get(key))
         if dt:
             break
@@ -184,7 +206,7 @@ target_dates = {yesterday, day_before}
 records = []
 
 for url in urls:
-    feed = feedparser.parse(url)
+    feed = feedparser.parse(url, request_headers=RSS_REQUEST_HEADERS)
     source_title = feed.feed.get("title", url)
 
     for entry in feed.entries:
@@ -193,6 +215,8 @@ for url in urls:
         # 过滤：只收“昨天或前天”（UTC 日期）——【变更2：范围从==昨天 改为 in {昨天, 前天}】
         if pub_date and pub_date.date() in target_dates:
             title = get_entry_title(entry)
+            if should_drop_by_title(title):
+                continue
             link = entry.get("link") or ""
             records.append({
                 "title": title,
