@@ -64,11 +64,12 @@ jobs:
       - name: Commit daily results (rebase-safe)
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          DISPATCH_TOKEN: ${{ secrets.TECH_DB_DISPATCH_TOKEN }}
         run: |
           set -e
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote set-url origin "https://x-access-token:${GITH...git"
 
           git add output/*.csv || true
           if git diff --cached --quiet; then
@@ -80,6 +81,14 @@ jobs:
           git fetch origin main
           git pull --rebase origin main
           git push origin HEAD:main
+
+          # 通知 tech-db 重建：新文献数据已推送
+          curl -sf -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${DISPATCH_TOKEN}" \
+            https://api.github.com/repos/sbq9712/tech-db/dispatches \
+            -d '{"event_type":"literature-updated","client_payload":{"source":"literature-rss-spider","job":"daily"}}' \
+            || echo "WARN: tech-db dispatch failed (non-fatal)"
 
   run-weekly-aggregate-with-abs:
     needs: run-rss-spider
@@ -141,11 +150,12 @@ jobs:
         if: steps.weekly_gate.outputs.run == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          DISPATCH_TOKEN: ${{ secrets.TECH_DB_DISPATCH_TOKEN }}
         run: |
           set -e
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote set-url origin "https://x-access-token:${GITH...git"
 
           git add output/weekly/*.csv || true
           if git diff --cached --quiet; then
@@ -157,3 +167,11 @@ jobs:
           git fetch origin main
           git pull --rebase origin main
           git push origin HEAD:main
+
+          # 通知 tech-db 重建：周报数据已推送
+          curl -sf -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${DISPATCH_TOKEN}" \
+            https://api.github.com/repos/sbq9712/tech-db/dispatches \
+            -d '{"event_type":"literature-updated","client_payload":{"source":"literature-rss-spider","job":"weekly"}}' \
+            || echo "WARN: tech-db dispatch failed (non-fatal)"
