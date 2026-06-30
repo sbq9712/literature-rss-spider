@@ -13,12 +13,10 @@ jobs:
       - name: Trigger tech-db refresh
         env:
           GITHUB_TOKEN: ${{ secrets.TECH_DB_DISPATCH_TOKEN }}
-          TARGET_REPO: sbq9712/tech-db
         run: |
-          payload=$(jq -n --arg repo "${{ github.repository }}" --arg ref "${{ github.ref_name }}" --arg sha "${{ github.sha }}" '{source:$repo,ref:$ref,sha:$sha}')
           curl -fsSL -X POST \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/${TARGET_REPO}/dispatches \
-            -d "{\"event_type\":\"source-updated\",\"client_payload\":${payload}}"
+            https://api.github.com/repos/sbq9712/tech-db/dispatches \
+            -d '{"event_type":"source-updated","client_payload":{"source":"literature-rss-spider"}}'
